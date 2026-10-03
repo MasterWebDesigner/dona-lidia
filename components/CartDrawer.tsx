@@ -1,0 +1,1173 @@
+"use client";
+
+import { useState, useMemo, useEffect, useRef } from "react";
+import { useCartStore, useOrderStore, useCustomerStore, useProductStore, totalItemsCount } from "@/lib/store";
+import type { Order, PaymentMethod, DeliveryType } from "@/types/database";
+import { formatCurrency, formatItemQty, formatWeightKg } from "@/lib/utils";
+import { openWhatsApp } from "@/lib/whatsapp";
+import { useNotificationStore, playNotificationSound } from "@/lib/notifications";
+import { useStoreConfig, DEFAULT_SETTINGS } from "@/lib/storeConfig";
+import {
+  paidSubtotal,
+  brindeProgress,
+  itemLineTotal,
+  availableBrindeFlavors,
+  subtotalParaBrinde,
+  getBrindeRegras,
+  itemContaParaBrinde,
+} from "@/lib/brinde";
+import { loyaltyProgress, brindesDisponiveis, saldoAposResgate } from "@/lib/fidelidade";
+import { consultarFidelidadePublica, type FidelidadePublica } from "@/lib/fidelidadePublica";
+import { validarEstoqueServidor, listarSemEstoque } from "@/lib/stockGuard";
+import { mascaraTelefone, higienizarTelefone, formatarTelefone, estadoTelefone, MENSAGEM_WHATSAPP_INVALIDO } from "@/lib/phone";
+import { horariosDisponiveis, horarioMinimoDoDia, validarHorarioPedido, validarHorarioServidor } from "@/lib/horarioMinimo";
+import { exigeSinalPedido, valorSinalPedido, detalheSinalPedido } from "@/lib/faturamento";
+import { urlWaMe } from "@/lib/whatsapp";
+
+const WINE = "#8B1D22";
+
+const PAYMENT_OPTIONS: { value: PaymentMethod; label: string; emoji: string }[] = [
+  { value: "pix", label: "Pix", emoji: "💠" },
+  { value: "cartao_credito", label: "Cartão de Crédito", emoji: "💳" },
+  { value: "cartao_debito", label: "Cartão de Débito", emoji: "💳" },
+  { value: "dinheiro", label: "Dinheiro", emoji: "💵" },
+];
+
+function hojeISO(): string {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
+
+export default function CartDrawer() {
+  const { items, isOpen, setOpen, removeItem, updateQuantity, updateNotes, setBrinde, clearBrinde, clearCart } = useCartStore();
+  const config = useStoreConfig();
+  const products = useProductStore((s) => s.products);
+  const categories = useProductStore((s) => s.categories);
+  const customers = useCustomerStore((s) => s.customers);
+  const [checkoutOpen, setCheckoutOpen] = useState(false);
+  const [confirmedOrder, setConfirmedOrder] = useState<Order | null>(null);
+  const [expandedNotes, setExpandedNotes] = useState<string | null>(null);
+  const [validationError, setValidationError] = useState("");
+  const [flavorOpen, setFlavorOpen] = useState(false);
+  const [phoneValue, setPhoneValue] = useState("");
+  const [nameValue, setNameValue] = useState("");
+  const [dateValue, setDateValue] = useState("");
+  const [timeValue, setTimeValue] = useState("");
+  const [deliveryType, setDeliveryType] = useState<DeliveryType>("retirada");
+  const [paymentMethod, setPaymentMethod] = useState<PaymentMethod>("pix");
+  const [trocoValue, setTrocoValue] = useState("");
+  const [addrStreet, setAddrStreet] = useState("");
+  const [addrNumber, setAddrNumber] = useState("");
+  const [addrDistrict, setAddrDistrict] = useState("");
+  const [addrComplement, setAddrComplement] = useState("");
+  const [redeemedPhones, setRedeemedPhones] = useState<Record<string, number>>({});
+  const addOrder = useOrderStore((s) => s.addOrder);
+  const upsertCustomer = useCustomerStore((s) => s.upsertCustomer);
+  const resgatarBrinde = useCustomerStore((s) => s.resgatarBrinde);
+  const setFidelidadeOffset = useCustomerStore((s) => s.setFidelidadeOffset);
+  const [offsetAnteriorResgate, setOffsetAnteriorResgate] = useState<number | null>(null);
+  const phoneDebounce = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [agora, setAgora] = useState(() => new Date());
+
+  const subtotal = paidSubtotal(items);
+  const contagemItens = totalItemsCount(items);
+  const brindeAtivo = config.brindeAtivo;
+  const regrasBrinde = getBrindeRegras();
+  const brindeSubtotal = subtotalParaBrinde(items, regrasBrinde);
+  const progress = brindeProgress(brindeSubtotal);
+  const temItemElegivel = items.some((i) => itemContaParaBrinde(i, regrasBrinde));
+  const horariosRetirada = config.timeSlots.length > 0 ? config.timeSlots : DEFAULT_SETTINGS.timeSlots;
+  const margemPreparo = Math.max(0, config.margemPreparoMinutos);
+  const horariosVisiveis = horariosDisponiveis(horariosRetirada, dateValue, margemPreparo, agora);
+  const dataEhoje = !!dateValue && dateValue === hojeISO();
+  const horarioMinimoHoje = dataEhoje ? horarioMinimoDoDia(dateValue, margemPreparo, agora) : null;
+  const categoriasPromoNomes = regrasBrinde.todasCategorias
+    ? []
+    : categories.filter((c) => regrasBrinde.categoriasPromo.includes(c.id)).map((c) => c.name);
+  const brindeItem = items.find((i) => i.is_brinde);
+  const brindeDiscount = items
+    .filter((i) => i.is_brinde)
+    .reduce((s, i) => s + (i.product.price || 0), 0);
+  const deliveryFee = deliveryType === "entrega" ? config.deliveryFee : 0;
+  const totalGeral = subtotal + deliveryFee;
+  const pedidoExigeSinal = exigeSinalPedido(items);
+  const valorEntrada = pedidoExigeSinal ? valorSinalPedido(totalGeral) : 0;
+  const valorRestante = Math.max(0, totalGeral - valorEntrada);
+  const detalheSinalConfirmado = confirmedOrder ? detalheSinalPedido(confirmedOrder) : null;
+  const contatoLoja = config.whatsappLoja || config.storePhone;
+  const flavors = useMemo(
+    () => availableBrindeFlavors(products, categories),
+    [products, categories, config.brindeCategoriaId, brindeAtivo]
+  );
+  const phoneClean = phoneValue.replace(/\D/g, "");
+  const [baseFidelidade, setBaseFidelidade] = useState<{
+    telefone: string;
+    valor: FidelidadePublica;
+  } | null>(null);
+
+  useEffect(() => {
+    let vivo = true;
+    if (phoneClean.length < 10) {
+      setBaseFidelidade(null);
+      return;
+    }
+    consultarFidelidadePublica(phoneClean).then((valor) => {
+      if (vivo) setBaseFidelidade({ telefone: phoneClean, valor });
+    });
+    return () => {
+      vivo = false;
+    };
+  }, [phoneClean]);
+
+  const loyalty = useMemo(() => {
+    if (!baseFidelidade || baseFidelidade.telefone !== phoneClean) return null;
+    const base = baseFidelidade.valor;
+    const forced = redeemedPhones[phoneClean];
+    const balance = forced !== undefined ? forced : base.balance;
+    const prog = loyaltyProgress(balance, config.valorMinimoBrinde);
+    return {
+      ...base,
+      balance,
+      ...prog,
+      name: nameValue,
+      brindes: brindesDisponiveis(balance, config.valorMinimoBrinde),
+    };
+  }, [baseFidelidade, phoneClean, redeemedPhones, nameValue, config.valorMinimoBrinde]);
+
+  useEffect(() => {
+    if (!brindeAtivo && items.some((i) => i.is_brinde)) clearBrinde();
+  }, [brindeAtivo, items, clearBrinde]);
+
+  useEffect(() => {
+    return () => {
+      if (phoneDebounce.current) clearTimeout(phoneDebounce.current);
+    };
+  }, []);
+
+  useEffect(() => {
+    const id = setInterval(() => setAgora(new Date()), 60000);
+    return () => clearInterval(id);
+  }, []);
+
+  if (!isOpen) return null;
+
+  function resetCheckoutFields() {
+    setValidationError("");
+    setFlavorOpen(false);
+    setPhoneValue("");
+    setNameValue("");
+    setDateValue("");
+    setTimeValue("");
+    setDeliveryType("retirada");
+    setPaymentMethod("pix");
+    setTrocoValue("");
+    setAddrStreet("");
+    setAddrNumber("");
+    setAddrDistrict("");
+    setAddrComplement("");
+    setRedeemedPhones({});
+    setOffsetAnteriorResgate(null);
+  }
+
+  async function handleConfirm() {
+    setValidationError("");
+
+    const name = nameValue.trim();
+    const phone = higienizarTelefone(phoneValue);
+
+    if (!name) { setValidationError("Informe seu nome completo"); return; }
+    if (!phone) { setValidationError(MENSAGEM_WHATSAPP_INVALIDO); return; }
+    if (!dateValue) { setValidationError("Informe a data desejada para a retirada"); return; }
+    if (dateValue < hojeISO()) { setValidationError("A data desejada não pode ser no passado"); return; }
+    if (!timeValue) { setValidationError("Informe o horário da retirada"); return; }
+
+    const checagemLocal = validarHorarioPedido({
+      scheduledDate: dateValue,
+      scheduledTime: timeValue,
+      margemPreparoMinutos: margemPreparo,
+      agora: new Date(),
+    });
+    if (!checagemLocal.ok) { setValidationError(checagemLocal.error); return; }
+
+    const checagemServidor = await validarHorarioServidor(dateValue, timeValue);
+    if (!checagemServidor.ok) {
+      setValidationError(checagemServidor.error || "Horário de retirada indisponível.");
+      return;
+    }
+
+    let address: string | undefined;
+    if (deliveryType === "entrega") {
+      if (!addrStreet.trim()) { setValidationError("Informe o endereço"); return; }
+      if (!addrNumber.trim()) { setValidationError("Informe o número"); return; }
+      if (!addrDistrict.trim()) { setValidationError("Informe o bairro"); return; }
+      const complement = addrComplement.trim() ? ` — ${addrComplement.trim()}` : "";
+      address = `${addrStreet.trim()}, ${addrNumber.trim()} - ${addrDistrict.trim()}${complement}`;
+    }
+
+    const trocoNum = paymentMethod === "dinheiro" && trocoValue
+      ? parseFloat(trocoValue.replace(/\./g, "").replace(",", ".")) || 0
+      : undefined;
+
+    const itensParaPedido = items.filter((i) => !i.is_brinde);
+
+    for (const item of itensParaPedido) {
+      if (item.product.ativo === false) {
+        setValidationError(
+          `${item.product.name} não está mais disponível no cardápio. Remova-o do carrinho.`
+        );
+        return;
+      }
+      if (item.product.is_available === false) {
+        setValidationError(
+          `${item.product.name} está esgotado. Remova-o do carrinho.`
+        );
+        return;
+      }
+      if (item.product.controlarEstoque && item.quantity > (item.product.estoque ?? 0)) {
+        const disp = Math.max(0, item.product.estoque ?? 0);
+        setValidationError(
+          `Sem estoque: ${item.product.name} (disponível: ${disp}, no carrinho: ${item.quantity}). Ajuste a quantidade.`
+        );
+        return;
+      }
+    }
+
+    const check = await validarEstoqueServidor(
+      items.map((i) => ({ productId: i.product.id, quantity: i.quantity }))
+    );
+    if (!check.ok) {
+      setValidationError(
+        `Itens indisponíveis: ${listarSemEstoque(check.insufficient)}. Ajuste o carrinho para finalizar.`
+      );
+      return;
+    }
+
+    upsertCustomer(name, phone);
+
+    let order: Order;
+    try {
+      order = await addOrder({
+        customerName: name,
+        customerPhone: phone,
+        items: [...items],
+        total: totalGeral,
+        deliveryType,
+        address,
+        scheduledDate: dateValue,
+        scheduledTime: timeValue,
+        paymentMethod,
+        trocoPara: trocoNum,
+        origem: "site",
+        status: "pendente",
+      });
+    } catch (err) {
+      setValidationError(err instanceof Error ? err.message : "Horário de retirada indisponível.");
+      return;
+    }
+
+    useNotificationStore.getState().addNotification({
+      title: "Novo Pedido!",
+      message: `${name} — ${formatCurrency(totalGeral)} (${deliveryType === "entrega" ? "Entrega" : "Retirada"})`,
+      type: "order",
+    });
+    playNotificationSound();
+
+    openWhatsApp(order.items, {
+      customerName: order.customerName,
+      customerPhone: formatarTelefone(phone),
+      deliveryType,
+      address,
+      scheduledDate: dateValue,
+      scheduledTime: timeValue,
+      paymentMethod,
+      trocoPara: trocoNum,
+      deliveryFee,
+      storePhone: config.storePhone,
+    });
+
+    setConfirmedOrder(order);
+    setRedeemedPhones({});
+    setOffsetAnteriorResgate(null);
+    clearCart();
+  }
+
+  function handleClose() {
+    setConfirmedOrder(null);
+    setCheckoutOpen(false);
+    resetCheckoutFields();
+    setOpen(false);
+  }
+
+  function handlePhoneChange(raw: string) {
+    const masked = mascaraTelefone(raw);
+    setPhoneValue(masked);
+    setValidationError("");
+    if (phoneDebounce.current) clearTimeout(phoneDebounce.current);
+    phoneDebounce.current = setTimeout(() => {
+      const digits = masked.replace(/\D/g, "");
+      if (digits.length >= 10) {
+        const match = customers.find((c) => (c.phone || "").replace(/\D/g, "") === digits);
+        if (match && !nameValue) setNameValue(match.name);
+      }
+    }, 300);
+  }
+
+  function handleRedeemLoyalty() {
+    if (!loyalty || !loyalty.eligible || brindeItem) return;
+    setFlavorOpen(true);
+  }
+
+  function handleSelectLoyaltyFlavor(productId: string) {
+    const flavor = flavors.find((f) => f.id === productId);
+    if (!flavor || !loyalty) return;
+    setBrinde(flavor);
+    setFlavorOpen(false);
+    if (loyalty.eligible && redeemedPhones[phoneClean] === undefined) {
+      setOffsetAnteriorResgate(Math.max(0, loyalty.autoTotal - loyalty.balance));
+      resgatarBrinde(phoneClean, loyalty.autoTotal, nameValue || undefined);
+      const restante = saldoAposResgate(loyalty.balance, config.valorMinimoBrinde);
+      setRedeemedPhones((prev) => ({ ...prev, [phoneClean]: restante }));
+    }
+  }
+
+  function desfazerResgate() {
+    if (brindeItem) clearBrinde();
+    if (offsetAnteriorResgate !== null && phoneClean) {
+      const autoTotal = baseFidelidade?.valor.autoTotal ?? loyalty?.autoTotal ?? 0;
+      const saldoRestaurado = Math.max(0, autoTotal - offsetAnteriorResgate);
+      setFidelidadeOffset(phoneClean, offsetAnteriorResgate, saldoRestaurado);
+      setBaseFidelidade((prev) =>
+        prev && prev.telefone === phoneClean
+          ? {
+              ...prev,
+              valor: {
+                ...prev.valor,
+                offset: offsetAnteriorResgate,
+                balance: saldoRestaurado,
+              },
+            }
+          : prev
+      );
+    }
+    setOffsetAnteriorResgate(null);
+    setRedeemedPhones((prev) => {
+      if (!(phoneClean in prev)) return prev;
+      const next = { ...prev };
+      delete next[phoneClean];
+      return next;
+    });
+    setFlavorOpen(false);
+  }
+
+  const formatDate = (dateStr: string) => {
+    if (!dateStr) return "";
+    const [y, m, d] = dateStr.split("-");
+    return `${d}/${m}/${y}`;
+  };
+
+  const stepLabel = confirmedOrder
+    ? "Pedido Confirmado"
+    : checkoutOpen
+      ? "Finalizar Pedido"
+      : "Seu Carrinho";
+
+  return (
+    <div className="fixed inset-0 z-50 flex justify-end">
+      <div className="absolute inset-0 bg-black/40 backdrop-blur-sm" onClick={handleClose} />
+      <div className="cart-drawer relative flex h-full w-full max-w-md flex-col bg-white shadow-2xl dark:bg-neutral-950 dark:text-neutral-100">
+        {/* Header */}
+        <div className="flex items-center justify-between border-b border-neutral-200 bg-white px-5 py-4 dark:border-neutral-800 dark:bg-neutral-950">
+          <div>
+            <div className="flex items-center gap-2">
+              <h2 className="text-lg font-bold text-neutral-900 dark:text-white">{stepLabel}</h2>
+              {contagemItens > 0 && (
+                <span className="rounded-full bg-[#8B1D22]/10 px-2 py-0.5 text-[10px] font-bold text-[#8B1D22] dark:bg-[#8B1D22]/30 dark:text-white">
+                  {contagemItens} {contagemItens === 1 ? "item" : "itens"}
+                </span>
+              )}
+            </div>
+            <div className="mt-1 h-0.5 w-10" style={{ backgroundColor: WINE }} />
+          </div>
+          <button
+            onClick={handleClose}
+            aria-label="Fechar"
+            className="flex h-8 w-8 items-center justify-center rounded-full text-neutral-400 transition-colors hover:bg-neutral-100 hover:text-neutral-700 dark:hover:bg-neutral-800"
+          >
+            ✕
+          </button>
+        </div>
+
+        {/* Step progress */}
+        {checkoutOpen && (
+          <div className="h-1 w-full bg-neutral-100 dark:bg-neutral-800">
+            <div
+              className="h-full transition-all duration-500"
+              style={{
+                width: confirmedOrder ? "100%" : "66%",
+                backgroundColor: WINE,
+              }}
+            />
+          </div>
+        )}
+
+        <div className="flex-1 overflow-y-auto px-5 py-4">
+          {/* ─── STEP 1: Cart ─── */}
+          {!checkoutOpen && !confirmedOrder && (
+            items.length === 0 ? (
+              <div className="py-12 text-center text-neutral-400">
+                <p className="text-lg font-semibold text-neutral-600 dark:text-neutral-300">Seu carrinho esta vazio.</p>
+                <button
+                  onClick={handleClose}
+                  className="mt-4 text-xs font-semibold transition-colors"
+                  style={{ color: WINE }}
+                >
+                  Voltar ao cardapio
+                </button>
+              </div>
+            ) : (
+              <div className="space-y-3">
+                {/* Fidelity bar */}
+                {brindeAtivo && temItemElegivel && (
+                  !progress.eligible ? (
+                    <div className="rounded-xl border border-neutral-200 bg-neutral-50 p-3 space-y-2 dark:border-neutral-800 dark:bg-neutral-900">
+                      <p className="text-xs font-semibold text-neutral-700 dark:text-neutral-300">
+                        Adicione mais {formatCurrency(progress.remaining)} em{" "}
+                        {categoriasPromoNomes.length > 0 ? categoriasPromoNomes.join(", ") : "doces"} e ganhe 1 brinde de fidelidade!
+                      </p>
+                      <div className="h-2 w-full overflow-hidden rounded-full bg-neutral-200 dark:bg-neutral-800">
+                        <div
+                          className="h-full rounded-full transition-all duration-500"
+                          style={{ width: `${progress.percent}%`, backgroundColor: WINE }}
+                        />
+                      </div>
+                      <div className="flex justify-between text-[10px] font-medium text-neutral-500">
+                        <span>{formatCurrency(brindeSubtotal)}</span>
+                        <span>{formatCurrency(config.valorMinimoBrinde)}</span>
+                      </div>
+                      {!regrasBrinde.todasCategorias && brindeSubtotal < subtotal && (
+                        <p className="text-[10px] font-medium text-neutral-500">
+                          Itens fora de {categoriasPromoNomes.join(" / ")} não contam para a meta do brinde.
+                        </p>
+                      )}
+                    </div>
+                  ) : (
+                    <div className="rounded-xl border border-emerald-200 bg-emerald-50 p-3 space-y-2 dark:border-emerald-900 dark:bg-emerald-950">
+                      <p className="text-xs font-bold text-emerald-700 dark:text-emerald-400">
+                        🎉 Parabéns! Você ganhou 1 brinde de fidelidade!
+                      </p>
+                      {brindeItem ? (
+                        <div className="flex items-center justify-between rounded-lg border border-emerald-200 bg-white px-3 py-2 dark:border-emerald-900 dark:bg-neutral-900">
+                          <span className="text-xs font-semibold text-emerald-700 dark:text-emerald-400">
+                            {brindeItem.product.name}
+                          </span>
+                          <button
+                            onClick={() => setFlavorOpen(true)}
+                            className="text-[10px] font-bold transition-opacity hover:opacity-80"
+                            style={{ color: WINE }}
+                          >
+                            Trocar sabor
+                          </button>
+                        </div>
+                      ) : (
+                        <>
+                          <p className="text-[11px] text-emerald-600 dark:text-emerald-500">
+                            Escolha o sabor disponível em estoque:
+                          </p>
+                          <button
+                            onClick={() => setFlavorOpen((v) => !v)}
+                            className="w-full rounded-lg border-2 border-dashed border-emerald-300 bg-white px-3 py-2 text-xs font-bold text-emerald-700 transition-colors hover:bg-emerald-100 dark:border-emerald-800 dark:bg-neutral-900 dark:hover:bg-emerald-950"
+                          >
+                            {flavorOpen ? "Fechar seletor" : "🎁 Escolher sabor do Brinde"}
+                          </button>
+                          {flavorOpen && (
+                            <div className="max-h-40 space-y-1 overflow-y-auto">
+                              {flavors.length === 0 && (
+                                <p className="text-[11px] text-neutral-500">Nenhum item do brinde em estoque no momento.</p>
+                              )}
+                              {flavors.map((f) => (
+                                <button
+                                  key={f.id}
+                                  onClick={() => {
+                                    setBrinde(f);
+                                    setFlavorOpen(false);
+                                  }}
+                                  className="flex w-full items-center justify-between rounded-lg border border-neutral-200 bg-white px-3 py-2 text-left text-xs transition-colors hover:border-emerald-300 hover:bg-emerald-50 dark:border-neutral-700 dark:bg-neutral-900"
+                                >
+                                  <span className="font-semibold text-neutral-800 dark:text-neutral-200">{f.name}</span>
+                                  <span className="font-bold text-emerald-600">GRÁTIS</span>
+                                </button>
+                              ))}
+                            </div>
+                          )}
+                        </>
+                      )}
+                    </div>
+                  )
+                )}
+
+                {/* Items */}
+                <ul className="space-y-3">
+                  {items.filter((item) => brindeAtivo || !item.is_brinde).map((item) => (
+                    <li
+                      key={`${item.product.id}${item.is_brinde ? "-brinde" : ""}`}
+                      className={`rounded-xl border p-3 space-y-2 ${
+                        item.is_brinde
+                          ? "border-emerald-200 bg-emerald-50/60 dark:border-emerald-900 dark:bg-emerald-950/40"
+                          : "border-neutral-200 bg-white dark:border-neutral-800 dark:bg-neutral-900"
+                      }`}
+                    >
+                      <div className="flex items-start gap-3">
+                        <div className="h-12 w-12 flex-shrink-0 overflow-hidden rounded-full bg-neutral-100 dark:bg-neutral-800">
+                          {item.product.image_url ? (
+                            <img src={item.product.image_url} alt={item.product.name} className="h-full w-full object-cover" />
+                          ) : (
+                            <span className="flex h-full w-full items-center justify-center text-xs font-bold text-neutral-400">
+                              {item.product.name.charAt(0)}
+                            </span>
+                          )}
+                        </div>
+                        <div className="min-w-0 flex-1">
+                          <p className="text-sm font-semibold text-neutral-900 dark:text-white">{item.product.name}</p>
+                          {item.is_brinde ? (
+                            <p className="text-xs font-bold">
+                              <span className="text-neutral-400 line-through">{formatCurrency(item.product.price)}</span>{" "}
+                              <span className="text-emerald-600">GRÁTIS (R$ 0,00)</span>
+                            </p>
+                          ) : (
+                            <p className="text-xs font-bold" style={{ color: WINE }}>
+                              {item.product.isCustomWeight
+                                ? `${formatWeightKg(item.quantity)} × ${formatCurrency(item.product.price)}/kg`
+                                : formatCurrency(item.product.price)}
+                            </p>
+                          )}
+                          {item.is_brinde && (
+                            <span className="mt-1 inline-block rounded-full bg-emerald-500/15 px-2 py-0.5 text-[9px] font-bold text-emerald-600">
+                              🎁 BRINDE FIDELIDADE
+                            </span>
+                          )}
+                        </div>
+                        <div className="flex flex-col items-end gap-2">
+                          <button
+                            onClick={() => removeItem(item.product.id)}
+                            className="text-xs text-neutral-400 transition-colors hover:text-red-500"
+                            aria-label="Remover"
+                          >
+                            ✕
+                          </button>
+                          {item.is_brinde ? (
+                            <span className="text-[10px] font-bold text-emerald-600">1 un</span>
+                          ) : item.product.isCustomWeight ? (
+                            <div className="flex items-center gap-1">
+                              <input
+                                type="number"
+                                step="0.5"
+                                min="1"
+                                value={item.quantity}
+                                onChange={(e) => updateQuantity(item.product.id, Math.max(1, Math.round((parseFloat(e.target.value.replace(",", ".")) || 1) * 2) / 2))}
+                                className="w-16 rounded-lg border border-neutral-200 bg-neutral-50 px-2 py-1 text-center text-xs font-bold text-neutral-800 outline-none focus:border-neutral-400 dark:border-neutral-700 dark:bg-neutral-800 dark:text-white"
+                                title="Peso (kg)"
+                              />
+                              <span className="text-[10px] font-semibold text-neutral-400">kg</span>
+                            </div>
+                          ) : (
+                            <div className="flex items-center gap-1">
+                              <button
+                                onClick={() => updateQuantity(item.product.id, item.quantity - 1)}
+                                className="flex h-7 w-7 items-center justify-center rounded-full border border-neutral-200 text-xs font-bold text-neutral-600 transition-colors hover:bg-neutral-100 dark:border-neutral-700 dark:text-neutral-300 dark:hover:bg-neutral-800"
+                              >
+                                −
+                              </button>
+                              <span className="w-6 text-center text-sm font-bold text-neutral-900 dark:text-white">{item.quantity}</span>
+                              <button
+                                onClick={() => updateQuantity(item.product.id, item.quantity + 1)}
+                                className="flex h-7 w-7 items-center justify-center rounded-full border border-neutral-200 text-xs font-bold text-neutral-600 transition-colors hover:bg-neutral-100 dark:border-neutral-700 dark:text-neutral-300 dark:hover:bg-neutral-800"
+                              >
+                                +
+                              </button>
+                            </div>
+                          )}
+                        </div>
+                      </div>
+
+                      {!item.is_brinde && (
+                        <div>
+                          <button
+                            onClick={() => setExpandedNotes(expandedNotes === item.product.id ? null : item.product.id)}
+                            className="text-[11px] text-neutral-400 transition-colors hover:text-neutral-700 dark:hover:text-neutral-200"
+                          >
+                            {item.notes ? `✎ ${item.notes}` : "+ Adicionar observação"}
+                          </button>
+                          {expandedNotes === item.product.id && (
+                            <input
+                              type="text"
+                              placeholder="Ex: Sem açúcar, com cobertura extra..."
+                              value={item.notes || ""}
+                              onChange={(e) => updateNotes(item.product.id, e.target.value)}
+                              className="mt-2 w-full rounded-lg border border-neutral-200 bg-neutral-50 px-3 py-2 text-xs text-neutral-800 placeholder-neutral-400 outline-none focus:border-neutral-400 dark:border-neutral-700 dark:bg-neutral-800 dark:text-white"
+                              autoFocus
+                            />
+                          )}
+                        </div>
+                      )}
+                    </li>
+                  ))}
+                </ul>
+
+                {items.some((i) => i.product.isCustomWeight) && (
+                  <p className="rounded-lg bg-neutral-50 px-3 py-2.5 text-[10px] leading-relaxed text-neutral-500 italic dark:bg-neutral-900">
+                    💡 Nota: Por se tratar de um produto 100% artesanal, o peso final do bolo pode sofrer pequenas variações. O valor final exato será confirmado na aprovação do pedido.
+                  </p>
+                )}
+
+                <div className="flex items-center justify-between border-t border-neutral-200 pt-3 dark:border-neutral-800">
+                  <span className="text-sm text-neutral-500">Subtotal</span>
+                  <span className="text-lg font-bold text-neutral-900 dark:text-white">{formatCurrency(subtotal)}</span>
+                </div>
+              </div>
+            )
+          )}
+
+          {/* ─── STEP 2: Checkout ─── */}
+          {checkoutOpen && !confirmedOrder && (
+            <div className="space-y-4">
+              {/* Resumo */}
+              <div className="rounded-xl border border-neutral-200 bg-neutral-50 p-4 dark:border-neutral-800 dark:bg-neutral-900">
+                <p className="mb-2 text-[10px] font-semibold uppercase tracking-wider" style={{ color: WINE }}>
+                  Resumo do Pedido
+                </p>
+                <div className="space-y-1">
+                  {items.map((item) => (
+                    <div key={`${item.product.id}${item.is_brinde ? "-brinde" : ""}`} className="space-y-0.5">
+                      <div className="flex justify-between text-xs text-neutral-600 dark:text-neutral-400">
+                        <span>
+                          {item.is_brinde && "🎁 "}
+                          {item.product.name} {formatItemQty(item.quantity, item.product.isCustomWeight)}
+                          {item.is_brinde && (
+                            <span className="ml-1 rounded bg-emerald-500/15 px-1 py-0.5 text-[9px] font-bold text-emerald-600">
+                              BRINDE
+                            </span>
+                          )}
+                        </span>
+                        {item.is_brinde ? (
+                          <span className="font-semibold text-emerald-600">
+                            <span className="mr-1 text-neutral-400 line-through">{formatCurrency(item.product.price)}</span>
+                            R$ 0,00
+                          </span>
+                        ) : (
+                          <span className="font-semibold">{formatCurrency(itemLineTotal(item))}</span>
+                        )}
+                      </div>
+                      {item.notes && (
+                        <p className="pl-2 text-[11px] text-neutral-400">obs: {item.notes}</p>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              {/* Dados do Cliente */}
+              <div className="space-y-3">
+                <p className="text-[10px] font-semibold uppercase tracking-wider text-neutral-500">Dados do Cliente</p>
+                <div>
+                  <label className="label-field">WhatsApp / Celular <span className="text-red-500">*</span></label>
+                  <input
+                    type="tel"
+                    required
+                    className="input-field"
+                    placeholder="(11) 99999-9999"
+                    value={phoneValue}
+                    onChange={(e) => handlePhoneChange(e.target.value)}
+                    onBlur={() => {
+                      const e = estadoTelefone(phoneValue);
+                      setPhoneValue(e.valor);
+                      setValidationError((prev) => (e.erro ? e.erro : prev === MENSAGEM_WHATSAPP_INVALIDO ? "" : prev));
+                    }}
+                  />
+                </div>
+                <div>
+                  <label className="label-field">Nome Completo <span className="text-red-500">*</span></label>
+                  <input
+                    type="text"
+                    required
+                    className="input-field"
+                    placeholder="Seu nome completo"
+                    value={nameValue}
+                    onChange={(e) => { setNameValue(e.target.value); setValidationError(""); }}
+                  />
+                </div>
+
+                {/* Loyalty */}
+                {brindeAtivo && temItemElegivel && loyalty && phoneClean.length >= 10 && (
+                  <div
+                    className={`rounded-xl border p-3 space-y-2 ${
+                      loyalty.eligible
+                        ? "border-emerald-200 bg-emerald-50 dark:border-emerald-900 dark:bg-emerald-950"
+                        : "border-neutral-200 bg-neutral-50 dark:border-neutral-800 dark:bg-neutral-900"
+                    }`}
+                  >
+                    <div className="flex items-center justify-between">
+                      <span className="text-xs font-semibold text-neutral-700 dark:text-neutral-300">
+                        Acumulado: {formatCurrency(loyalty.balance)}
+                      </span>
+                      <span
+                        className="text-xs font-bold"
+                        style={{ color: loyalty.eligible ? "#059669" : WINE }}
+                      >
+                        {loyalty.brindes} Brinde{loyalty.brindes === 1 ? "" : "s"} disponível
+                        {loyalty.brindes === 1 ? "" : "s"}
+                      </span>
+                    </div>
+                    <p className={`text-xs font-semibold ${loyalty.eligible ? "text-emerald-700 dark:text-emerald-400" : "text-neutral-700 dark:text-neutral-300"}`}>
+                      {loyalty.eligible
+                        ? `Você tem ${loyalty.brindes} Brinde${loyalty.brindes === 1 ? "" : "s"} disponível${loyalty.brindes === 1 ? "" : "s"} para resgatar! 🎉`
+                        : `Fidelidade: falta ${formatCurrency(loyalty.remaining)} para mais 1 Brinde grátis!`}
+                    </p>
+                    <div className={`h-2 w-full overflow-hidden rounded-full ${loyalty.eligible ? "bg-emerald-100 dark:bg-emerald-950" : "bg-neutral-200 dark:bg-neutral-800"}`}>
+                      <div
+                        className="h-full rounded-full transition-all duration-500"
+                        style={{
+                          width: `${loyalty.percent}%`,
+                          backgroundColor: loyalty.eligible ? "#10b981" : WINE,
+                        }}
+                      />
+                    </div>
+                    <div className={`flex justify-between text-[10px] font-medium ${loyalty.eligible ? "text-emerald-600" : "text-neutral-500"}`}>
+                      <span>{formatCurrency(loyalty.balance)}</span>
+                      <span>
+                        {formatCurrency(config.valorMinimoBrinde)} — {Math.round(loyalty.percent)}%
+                        {loyalty.eligible ? " — Pronto p/ Brinde" : ""}
+                      </span>
+                    </div>
+
+                    <label
+                      className={`flex items-start gap-2 rounded-lg border px-3 py-2 ${
+                        !brindeItem && loyalty.brindes < 1
+                          ? "cursor-not-allowed border-neutral-200 bg-white/60 opacity-70 dark:border-neutral-700 dark:bg-neutral-900/60"
+                          : "border-emerald-300 bg-white dark:border-emerald-800 dark:bg-neutral-900"
+                      }`}
+                    >
+                      <input
+                        type="checkbox"
+                        checked={!!brindeItem}
+                        disabled={!brindeItem && loyalty.brindes < 1}
+                        onChange={(e) => {
+                          if (e.target.checked) handleRedeemLoyalty();
+                          else desfazerResgate();
+                        }}
+                        className="mt-0.5 h-4 w-4 shrink-0 accent-[#8B1D22]"
+                      />
+                      <span className="text-xs font-semibold text-neutral-700 dark:text-neutral-300">
+                        Resgatar Brinde Disponível{" "}
+                        <span className="font-normal opacity-70">(desconta 1 brinde do saldo)</span>
+                      </span>
+                    </label>
+
+                    {flavorOpen && (
+                      <div className="max-h-40 space-y-1 overflow-y-auto">
+                        {flavors.length === 0 && (
+                          <p className="text-[11px] text-neutral-500">Nenhum item do brinde em estoque no momento.</p>
+                        )}
+                        {flavors.map((f) => (
+                          <button
+                            key={f.id}
+                            type="button"
+                            onClick={() => handleSelectLoyaltyFlavor(f.id)}
+                            className="flex w-full items-center justify-between rounded-lg border border-neutral-200 bg-white px-3 py-2 text-left text-xs transition-colors hover:border-emerald-300 hover:bg-emerald-50 dark:border-neutral-700 dark:bg-neutral-900"
+                          >
+                            <span className="font-semibold text-neutral-800 dark:text-neutral-200">{f.name}</span>
+                            <span className="font-bold text-emerald-600">GRÁTIS</span>
+                          </button>
+                        ))}
+                      </div>
+                    )}
+
+                    {brindeItem && (
+                      <div className="flex items-center justify-between rounded-lg border border-emerald-200 bg-white px-3 py-2 dark:border-emerald-900 dark:bg-neutral-900">
+                        <span className="text-xs font-semibold text-emerald-700 dark:text-emerald-400">
+                          🎁 {brindeItem.product.name}
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => setFlavorOpen(true)}
+                          className="text-[10px] font-bold transition-opacity hover:opacity-80"
+                          style={{ color: WINE }}
+                        >
+                          Trocar sabor
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+
+              {/* Data da Retirada */}
+              <div className="space-y-3">
+                <p className="text-[10px] font-semibold uppercase tracking-wider text-neutral-500">Data da Retirada <span className="text-red-500">*</span></p>
+                <input
+                  type="date"
+                  className="input-field"
+                  min={hojeISO()}
+                  value={dateValue}
+                  onChange={(e) => {
+                    const novaData = e.target.value;
+                    setDateValue(novaData);
+                    setValidationError("");
+                    const disponiveis = horariosDisponiveis(horariosRetirada, novaData, margemPreparo, agora);
+                    if (timeValue && !disponiveis.includes(timeValue)) setTimeValue("");
+                  }}
+                />
+                <label className="label-field">Horário da Retirada <span className="text-red-500">*</span></label>
+                <select
+                  className="input-field"
+                  value={timeValue}
+                  onChange={(e) => { setTimeValue(e.target.value); setValidationError(""); }}
+                >
+                  <option value="">Selecione o horário</option>
+                  {horariosVisiveis.map((h) => (
+                    <option key={h} value={h}>{h}</option>
+                  ))}
+                </select>
+                {dataEhoje && horarioMinimoHoje && horariosVisiveis.length > 0 && (
+                  <p className="text-xs text-neutral-500">
+                    Pedidos para hoje somente a partir de {horarioMinimoHoje} (margem de preparo de {margemPreparo} min).
+                  </p>
+                )}
+                {dateValue && horariosVisiveis.length === 0 && (
+                  <p className="text-xs font-semibold text-red-500">
+                    Nenhum horário disponível para esta data. {dataEhoje ? "Escolha outro dia ou aguarde o próximo horário liberado." : "Edite os horários em Configurações."}
+                  </p>
+                )}
+                <p className="text-xs text-neutral-500">Escolha o dia e o horário em que pretende retirar o pedido.</p>
+              </div>
+
+              {/* Entrega / Retirada */}
+              <div className="space-y-3">
+                <p className="text-[10px] font-semibold uppercase tracking-wider text-neutral-500">Entrega / Retirada</p>
+                <div className="grid grid-cols-2 gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setDeliveryType("retirada")}
+                    className={`rounded-xl border-2 px-3 py-3 text-xs font-semibold transition-all ${
+                      deliveryType === "retirada"
+                        ? "text-white shadow-md"
+                        : "border-neutral-200 bg-white text-neutral-500 hover:border-neutral-300 dark:border-neutral-700 dark:bg-neutral-900 dark:hover:border-neutral-600"
+                    }`}
+                    style={
+                      deliveryType === "retirada"
+                        ? { borderColor: WINE, backgroundColor: WINE }
+                        : undefined
+                    }
+                  >
+                    🏪 Retirada na Loja
+                  </button>
+                  <button
+                    type="button"
+                    disabled
+                    title="Delivery temporariamente indisponível"
+                    className="cursor-not-allowed rounded-xl border-2 border-neutral-200 bg-neutral-100 px-3 py-3 text-xs font-semibold text-neutral-400 opacity-70 dark:border-neutral-700 dark:bg-neutral-800/60 dark:text-neutral-500"
+                  >
+                    🚚 Entrega / Delivery
+                    <span className="mt-1 block text-[10px] font-medium">Indisponível no momento</span>
+                  </button>
+                </div>
+
+                {deliveryType === "entrega" && (
+                  <div className="space-y-3 rounded-xl border border-neutral-200 bg-neutral-50 p-3 dark:border-neutral-800 dark:bg-neutral-900">
+                    <div className="grid grid-cols-[1fr_80px] gap-2">
+                      <div>
+                        <label className="label-field">Endereço <span className="text-red-500">*</span></label>
+                        <input
+                          type="text"
+                          className="input-field"
+                          placeholder="Rua / Avenida"
+                          value={addrStreet}
+                          onChange={(e) => { setAddrStreet(e.target.value); setValidationError(""); }}
+                        />
+                      </div>
+                      <div>
+                        <label className="label-field">Número <span className="text-red-500">*</span></label>
+                        <input
+                          type="text"
+                          className="input-field"
+                          placeholder="123"
+                          value={addrNumber}
+                          onChange={(e) => { setAddrNumber(e.target.value); setValidationError(""); }}
+                        />
+                      </div>
+                    </div>
+                    <div className="grid grid-cols-2 gap-2">
+                      <div>
+                        <label className="label-field">Bairro <span className="text-red-500">*</span></label>
+                        <input
+                          type="text"
+                          className="input-field"
+                          placeholder="Centro"
+                          value={addrDistrict}
+                          onChange={(e) => { setAddrDistrict(e.target.value); setValidationError(""); }}
+                        />
+                      </div>
+                      <div>
+                        <label className="label-field">Complemento</label>
+                        <input
+                          type="text"
+                          className="input-field"
+                          placeholder="Apto, bloco..."
+                          value={addrComplement}
+                          onChange={(e) => setAddrComplement(e.target.value)}
+                        />
+                      </div>
+                    </div>
+                    <p className="text-xs text-neutral-500">
+                      Taxa de entrega: <span className="font-bold" style={{ color: WINE }}>{formatCurrency(config.deliveryFee)}</span>
+                    </p>
+                  </div>
+                )}
+              </div>
+
+              {/* Pagamento */}
+              <div className="space-y-3">
+                <p className="text-[10px] font-semibold uppercase tracking-wider text-neutral-500">Forma de Pagamento</p>
+                <div className="grid grid-cols-2 gap-2">
+                  {PAYMENT_OPTIONS.map((opt) => (
+                    <button
+                      key={opt.value}
+                      type="button"
+                      onClick={() => setPaymentMethod(opt.value)}
+                      className={`flex flex-col items-center gap-1 rounded-xl border-2 px-3 py-3 text-xs font-semibold transition-all ${
+                        paymentMethod === opt.value
+                          ? "text-white shadow-md"
+                          : "border-neutral-200 bg-white text-neutral-500 hover:border-neutral-300 dark:border-neutral-700 dark:bg-neutral-900"
+                      }`}
+                      style={
+                        paymentMethod === opt.value
+                          ? { borderColor: WINE, backgroundColor: WINE }
+                          : undefined
+                      }
+                    >
+                      <span className="text-lg">{opt.emoji}</span>
+                      <span className="text-center leading-tight">{opt.label}</span>
+                    </button>
+                  ))}
+                </div>
+                {paymentMethod === "dinheiro" && (
+                  <div>
+                    <label className="label-field">Precisa de troco para quanto? (opcional)</label>
+                    <input
+                      type="text"
+                      inputMode="decimal"
+                      className="input-field"
+                      placeholder="Ex: 100,00"
+                      value={trocoValue}
+                      onChange={(e) => setTrocoValue(e.target.value)}
+                    />
+                  </div>
+                )}
+              </div>
+
+              {/* Sinal de 50% */}
+              {pedidoExigeSinal && (
+                <div className="rounded-xl border-2 border-amber-400 bg-amber-50 p-4 dark:border-amber-500/60 dark:bg-amber-500/10">
+                  <p className="text-sm font-bold text-amber-800 dark:text-amber-300">
+                    ⚠️ Atenção: Este pedido exige 50% de entrada ({formatCurrency(valorEntrada)}) para confirmação da encomenda. O valor restante será pago na entrega/retirada.
+                  </p>
+                  <dl className="mt-3 space-y-1 text-xs text-amber-900/80 dark:text-amber-200/80">
+                    <div className="flex justify-between">
+                      <dt>Valor Total:</dt>
+                      <dd className="font-bold">{formatCurrency(totalGeral)}</dd>
+                    </div>
+                    <div className="flex justify-between">
+                      <dt>Valor de Entrada (50%):</dt>
+                      <dd className="font-bold">{formatCurrency(valorEntrada)}</dd>
+                    </div>
+                    <div className="flex justify-between">
+                      <dt>Valor Restante no Final:</dt>
+                      <dd className="font-bold">{formatCurrency(valorRestante)}</dd>
+                    </div>
+                  </dl>
+                </div>
+              )}
+
+              {/* Resumo Financeiro */}
+              <div className="rounded-xl border border-neutral-200 bg-white p-4 dark:border-neutral-800 dark:bg-neutral-900">
+                <p className="mb-3 text-[10px] font-semibold uppercase tracking-wider" style={{ color: WINE }}>
+                  Resumo Financeiro
+                </p>
+                <div className="space-y-2 text-sm">
+                  <div className="flex justify-between text-neutral-600 dark:text-neutral-400">
+                    <span>Subtotal dos Produtos</span>
+                    <span className="font-semibold text-neutral-900 dark:text-white">{formatCurrency(subtotal)}</span>
+                  </div>
+                  {deliveryType === "entrega" && (
+                    <div className="flex justify-between text-neutral-600 dark:text-neutral-400">
+                      <span>Taxa de Entrega</span>
+                      <span className="font-semibold text-neutral-900 dark:text-white">{formatCurrency(deliveryFee)}</span>
+                    </div>
+                  )}
+                  {brindeDiscount > 0 && (
+                    <div className="flex justify-between text-emerald-600">
+                      <span>Desconto / Brinde Resgatado</span>
+                      <span className="font-semibold">− {formatCurrency(brindeDiscount)}</span>
+                    </div>
+                  )}
+                  <div className="flex justify-between border-t border-neutral-200 pt-2 dark:border-neutral-700">
+                    <span className="text-base font-bold text-neutral-900 dark:text-white">Total Geral</span>
+                    <span className="text-lg font-bold" style={{ color: WINE }}>{formatCurrency(totalGeral)}</span>
+                  </div>
+                </div>
+              </div>
+
+              {validationError && (
+                <p className="text-center text-xs font-medium text-red-500">{validationError}</p>
+              )}
+            </div>
+          )}
+
+          {/* ─── STEP 3: Confirmed ─── */}
+          {confirmedOrder && (
+            <div className="space-y-4">
+              <div className="rounded-xl border border-emerald-200 bg-emerald-50 p-4 text-center dark:border-emerald-900 dark:bg-emerald-950">
+                <p className="text-lg font-bold text-emerald-700 dark:text-emerald-400">Pedido Enviado!</p>
+                <p className="mt-1 text-sm text-emerald-600 dark:text-emerald-500">
+                  Pedido registrado e WhatsApp aberto com o resumo.
+                </p>
+                <p className="mt-2 text-xs text-emerald-500">Protocolo: {confirmedOrder.orderNumber || confirmedOrder.id.slice(-8)}</p>
+              </div>
+
+              {detalheSinalConfirmado?.exigido && (
+                <div className="rounded-xl border-2 border-amber-400 bg-amber-50 p-4 dark:border-amber-500/60 dark:bg-amber-500/10">
+                  <p className="text-sm font-bold text-amber-800 dark:text-amber-300">
+                    Pedido recebido! Para iniciar a produção, realize o pagamento da entrada de 50% ({formatCurrency(detalheSinalConfirmado.valor)}). A Ilma entrará em contato para alinhar os detalhes e enviar a chave Pix, ou você pode{" "}
+                    {contatoLoja.replace(/\D/g, "") ? (
+                      <a
+                        href={urlWaMe(contatoLoja, "")}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="underline hover:text-amber-900 dark:hover:text-amber-200"
+                      >
+                        chamar no WhatsApp
+                      </a>
+                    ) : (
+                      "chamar no WhatsApp"
+                    )}
+                    .
+                  </p>
+                  <p className="mt-2 text-xs font-semibold text-amber-700 dark:text-amber-400">
+                    Status do pedido: Pendente — entrada {detalheSinalConfirmado.pago ? "paga" : "aguardando pagamento"}.
+                  </p>
+                </div>
+              )}
+
+              <div className="rounded-xl border border-neutral-200 bg-neutral-50 p-4 dark:border-neutral-800 dark:bg-neutral-900">
+                <p className="mb-2 text-[10px] font-semibold uppercase tracking-wider" style={{ color: WINE }}>
+                  Detalhes do Pedido
+                </p>
+                <div className="space-y-2 text-sm">
+                  <div className="flex justify-between">
+                    <span className="text-neutral-500">Cliente</span>
+                    <span className="font-semibold text-neutral-900 dark:text-white">{confirmedOrder.customerName}</span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span className="text-neutral-500">Tipo</span>
+                    <span className="font-semibold text-neutral-900 dark:text-white">
+                      {confirmedOrder.deliveryType === "entrega" ? "Entrega" : "Retirada"}
+                    </span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span className="text-neutral-500">Data da Retirada</span>
+                    <span className="font-semibold text-neutral-900 dark:text-white">
+                      {confirmedOrder.scheduledDate ? formatDate(confirmedOrder.scheduledDate) : "—"}
+                    </span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span className="text-neutral-500">Horário da Retirada</span>
+                    <span className="font-semibold text-neutral-900 dark:text-white">
+                      {confirmedOrder.scheduledTime || "—"}
+                    </span>
+                  </div>
+                  {confirmedOrder.address && (
+                    <div className="flex justify-between gap-3">
+                      <span className="shrink-0 text-neutral-500">Endereço</span>
+                      <span className="text-right font-semibold text-neutral-900 dark:text-white">{confirmedOrder.address}</span>
+                    </div>
+                  )}
+                  <div className="flex justify-between">
+                    <span className="text-neutral-500">Pagamento</span>
+                    <span className="font-semibold capitalize text-neutral-900 dark:text-white">
+                      {PAYMENT_OPTIONS.find((p) => p.value === confirmedOrder.paymentMethod)?.label || confirmedOrder.paymentMethod}
+                    </span>
+                  </div>
+                  <div className="flex justify-between border-t border-neutral-200 pt-2 dark:border-neutral-700 font-bold">
+                    <span className="text-neutral-900 dark:text-white">Total</span>
+                    <span style={{ color: WINE }}>{formatCurrency(confirmedOrder.total)}</span>
+                  </div>
+                </div>
+              </div>
+
+              <p className="text-center text-xs text-neutral-500">
+                A Ilma irá confirmar a disponibilidade e o horário pelo WhatsApp.
+              </p>
+            </div>
+          )}
+        </div>
+
+        {/* Footer */}
+        <div className="border-t border-neutral-200 bg-white px-5 py-4 dark:border-neutral-800 dark:bg-neutral-950">
+          {/* Cart step */}
+          {!checkoutOpen && !confirmedOrder && items.length > 0 && (
+            <div className="space-y-2">
+              <div className="flex items-center justify-between">
+                <span className="text-sm text-neutral-500">Subtotal</span>
+                <span className="text-xl font-bold text-neutral-900 dark:text-white">{formatCurrency(subtotal)}</span>
+              </div>
+              <button
+                onClick={() => { setCheckoutOpen(true); setValidationError(""); }}
+                className="btn w-full text-white shadow-lg transition-all hover:-translate-y-0.5 hover:shadow-xl"
+                style={{ backgroundColor: WINE }}
+              >
+                Finalizar Pedido
+              </button>
+              <button
+                onClick={clearCart}
+                className="w-full text-center text-xs text-neutral-400 transition-colors hover:text-neutral-600 dark:hover:text-neutral-300"
+              >
+                Limpar carrinho
+              </button>
+            </div>
+          )}
+
+          {/* Checkout step */}
+          {checkoutOpen && !confirmedOrder && (
+            <div className="flex gap-2">
+              <button
+                type="button"
+                onClick={() => { setCheckoutOpen(false); setValidationError(""); }}
+                className="rounded-xl border border-neutral-200 px-4 py-3 text-sm font-medium text-neutral-500 transition-colors hover:bg-neutral-50 dark:border-neutral-700 dark:hover:bg-neutral-900"
+              >
+                Voltar
+              </button>
+              <button
+                type="button"
+                onClick={handleConfirm}
+                className="flex-1 rounded-xl px-4 py-3 text-sm font-bold text-white shadow-lg transition-all hover:-translate-y-0.5 hover:shadow-xl"
+                style={{ backgroundColor: WINE }}
+              >
+                Finalizar Pedido via WhatsApp
+              </button>
+            </div>
+          )}
+
+          {/* Confirmed */}
+          {confirmedOrder && (
+            <button
+              onClick={handleClose}
+              className="btn w-full text-white shadow-lg transition-all hover:-translate-y-0.5"
+              style={{ backgroundColor: WINE }}
+            >
+              Continuar Comprando
+            </button>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
